@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>OpenVR Mobile — Room Tracker</title>
+<style>
+:root{color-scheme:dark;--bg:#10141d;--panel:#1a2230;--line:#303c50;--text:#edf3ff;--muted:#aab7cc;--accent:#68a7ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,Arial,sans-serif}
+main{max-width:850px;margin:auto;padding:18px;display:grid;gap:14px}
+h1{margin:0;font-size:1.6rem}h2{font-size:1.05rem;margin:0 0 8px}
+p{color:var(--muted);line-height:1.45;margin:6px 0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px}
+button,select{background:#26364e;color:var(--text);border:1px solid #49617f;border-radius:9px;padding:11px 13px;font-size:15px}
+button:disabled{opacity:.45}button.primary{background:#245da8;border-color:#4788dc}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+video{width:100%;max-height:48vh;object-fit:cover;background:#05070b;border-radius:10px}
+canvas{display:none}.statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{background:#111925;border-radius:9px;padding:10px}.stat b{display:block;font-size:1.1rem}
+small{color:var(--muted)}progress{width:100%;height:13px;accent-color:var(--accent)}
+#shots{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+.shot{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#111925;min-width:0}
+.shot img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block}
+.shot span{display:block;padding:5px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.notice{border-left:3px solid #e0ad4c;padding-left:10px}
+.good{color:#8fe0ad}.warn{color:#ffd27d}
+@media(max-width:520px){main{padding:12px}.statgrid{grid-template-columns:repeat(2,1fr)}#shots{grid-template-columns:repeat(3,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>OpenVR Mobile</h1>
+    <p>Room reference scanner + experimental live camera motion tracker.</p>
+  </header>
+
+  <section class="panel">
+    <h2>1. Camera</h2>
+    <div class="controls">
+      <button class="primary" id="start">Start rear camera</button>
+      <button id="stop" disabled>Stop camera</button>
+      <button id="sensor">Enable motion sensors</button>
+    </div>
+    <p id="cameraStatus">Camera is off. Allow camera access when your browser asks.</p>
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="work"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>2. Scan your room</h2>
+    <p>Keep your feet in one safe spot. Face each direction and capture the five views. Turn your whole body carefully between directions. Do not walk around while wearing a headset.</p>
+    <div class="controls">
+      <label for="direction">Direction</label>
+      <select id="direction">
+        <option value="Front">Front</option><option value="Right">Right</option>
+        <option value="Back">Back</option><option value="Left">Left</option>
+      </select>
+      <label for="height">View</label>
+      <select id="height">
+        <option value="Top">Top</option><option value="Top-middle">Top-middle</option>
+        <option value="Middle" selected>Middle</option><option value="Middle-bottom">Middle-bottom</option>
+        <option value="Bottom">Bottom</option>
+      </select>
+      <button class="primary" id="capture" disabled>Capture reference</button>
+    </div>
+    <p id="scanStatus">0 / 20 reference pictures saved.</p>
+    <progress id="progress" max="20" value="0"></progress>
+    <div class="controls" style="margin-top:10px">
+      <button id="export">Export scan backup</button>
+      <button id="clear">Delete saved scan</button>
+    </div>
+    <div id="shots"></div>
+  </section>
+
+  <section class="panel">
+    <h2>3. Live motion experiment</h2>
+    <p>Move the phone slowly while looking at a detailed, stationary part of the room. The tracker compares consecutive camera frames and estimates 2D image movement.</p>
+    <div class="statgrid">
+      <div class="stat"><small>Image movement X</small><b id="dx">0 px</b></div>
+      <div class="stat"><small>Image movement Y</small><b id="dy">0 px</b></div>
+      <div class="stat"><small>Tracked patches</small><b id="tracks">0</b></div>
+      <div class="stat"><small>Yaw sensor</small><b id="yaw">—</b></div>
+      <div class="stat"><small>Pitch sensor</small><b id="pitch">—</b></div>
+      <div class="stat"><small>Roll sensor</small><b id="roll">—</b></div>
+    </div>
+    <p id="trackingStatus">Start the camera to begin tracking.</p>
+  </section>
+
+  <section class="panel">
+    <h2>What this prototype can and cannot do</h2>
+    <p class="good">It can capture your 20 reference images, save them on this phone, and estimate frame-to-frame 2D image movement. If permitted, it also reads the phone's orientation sensors.</p>
+    <p class="notice">This is not yet full 6DoF SLAM or hand tracking. A single ordinary camera cannot determine reliable real-world distance/scale from these pictures alone. The next stage needs calibrated camera geometry and a real visual-SLAM map; hand tracking is a separate camera-vision module.</p>
+  </section>
+</main>
+<script>
+const video=document.getElementById('video'), canvas=document.getElementById('work'), ctx=canvas.getContext('2d',{willReadFrequently:true});
+const startBtn=document.getElementById('start'),stopBtn=document.getElementById('stop'),captureBtn=document.getElementById('capture');
+let stream=null,raf=0,previous=null,lastSensor={yaw:null,pitch:null,roll:null},sensorEnabled=false;
+const DB='openvr-mobile-db', STORE='references';
+function openDB(){return new Promise((resolve,reject)=>{const r=indexedDB.open(DB,1);r.onupgradeneeded=()=>r.result.createObjectStore(STORE,{keyPath:'id'});r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
+async function allShots(){const db=await openDB();return new Promise((resolve,reject)=>{const r=db.transaction(STORE).objectStore(STORE).getAll();r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
+async function putShot(item){const db=await openDB();return new Promise((resolve,reject)=>{const r=db.transaction(STORE,'readwrite').objectStore(STORE).put(item);r.onsuccess=()=>resolve();r.onerror=()=>reject(r.error);});}
+async function clearShots(){const db=await openDB();return new Promise((resolve,reject)=>{const r=db.transaction(STORE,'readwrite').objectStore(STORE).clear();r.onsuccess=()=>resolve();r.onerror=()=>reject(r.error);});}
+const key=()=>document.getElementById('direction').value+' / '+document.getElementById('height').value;
+async function renderShots(){
+ const shots=await allShots(), wrap=document.getElementById('shots');wrap.innerHTML='';
+ const names=['Front','Right','Back','Left'], heights=['Top','Top-middle','Middle','Middle-bottom','Bottom'];
+ for(const d of names)for(const h of heights){const id=d+' / '+h, item=shots.find(s=>s.id===id), div=document.createElement('div');div.className='shot';
+  if(item){const img=document.createElement('img');img.src=item.data;div.appendChild(img);}
+  const label=document.createElement('span');label.textContent=(item?'✓ ':'○ ')+id;div.appendChild(label);wrap.appendChild(div);
+ }
+ document.getElementById('scanStatus').textContent=shots.length+' / 20 reference pictures saved.';
+ document.getElementById('progress').value=shots.length;
+}
+async function startCamera(){
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
+  video.srcObject=stream;await video.play();startBtn.disabled=true;stopBtn.disabled=false;captureBtn.disabled=false;
+  document.getElementById('cameraStatus').textContent='Rear camera running.';
+  document.getElementById('trackingStatus').textContent='Tracking image movement…';
+  previous=null;trackLoop();
+ }catch(e){document.getElementById('cameraStatus').textContent='Could not start camera: '+e.message+'. Open this page over HTTPS and allow camera access.';}
+}
+function stopCamera(){cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;startBtn.disabled=false;stopBtn.disabled=true;captureBtn.disabled=true;previous=null;document.getElementById('cameraStatus').textContent='Camera stopped.';}
+startBtn.onclick=startCamera;stopBtn.onclick=stopCamera;
+captureBtn.onclick=async()=>{
+ if(!video.videoWidth)return;
+ const c=document.createElement('canvas');c.width=640;c.height=Math.round(640*video.videoHeight/video.videoWidth);
+ c.getContext('2d').drawImage(video,0,0,c.width,c.height);
+ const item={id:key(),data:c.toDataURL('image/jpeg',0.78),savedAt:new Date().toISOString()};
+ await putShot(item);await renderShots();
+ document.getElementById('cameraStatus').textContent='Saved '+item.id+' on this phone.';
+};
+document.getElementById('clear').onclick=async()=>{if(confirm('Delete all 20 room reference pictures stored by this app?')){await clearShots();await renderShots();}};
+document.getElementById('export').onclick=async()=>{const data=await allShots();const blob=new Blob([JSON.stringify({app:'OpenVR Mobile',version:1,references:data},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='openvr-room-scan.json';a.click();URL.revokeObjectURL(url);};
+function grayFrame(){
+ const w=160,h=120;canvas.width=w;canvas.height=h;ctx.drawImage(video,0,0,w,h);const d=ctx.getImageData(0,0,w,h).data,g=new Uint8Array(w*h);
+ for(let i=0,j=0;i<d.length;i+=4,j++)g[j]=(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114)|0;
+ return {g,w,h};
+}
+function patchCost(a,b,w,x1,y1,x2,y2,r=2){let sum=0,n=0;for(let yy=-r;yy<=r;yy++)for(let xx=-r;xx<=r;xx++){const i=(y1+yy)*w+x1+xx,j=(y2+yy)*w+x2+xx;sum+=Math.abs(a[i]-b[j]);n++;}return sum/n;}
+function trackLoop(){
+ if(!stream||video.readyState<2){raf=requestAnimationFrame(trackLoop);return;}
+ const cur=grayFrame();
+ if(previous){
+  const {g:old,w,h}=previous, now=cur.g, shifts=[];
+  for(let y=12;y<h-12;y+=18)for(let x=12;x<w-12;x+=18){
+   let texture=0;for(let yy=-2;yy<=2;yy++)for(let xx=-2;xx<=2;xx++)texture+=Math.abs(old[(y+yy)*w+x+xx]-old[(y+yy)*w+x+xx+1]);
+   if(texture<90)continue;
+   let best=1e9,bx=0,by=0;
+   for(let dy=-7;dy<=7;dy++)for(let dx=-7;dx<=7;dx++){const c=patchCost(old,now,w,x,y,x+dx,y+dy);if(c<best){best=c;bx=dx;by=dy;}}
+   if(best<28)shifts.push([bx,by]);
+  }
+  if(shifts.length){
+   const median=i=>{const a=shifts.map(s=>s[i]).sort((x,y)=>x-y);return a[Math.floor(a.length/2)];};
+   const x=median(0),y=median(1);document.getElementById('dx').textContent=x.toFixed(1)+' px';document.getElementById('dy').textContent=y.toFixed(1)+' px';document.getElementById('tracks').textContent=shifts.length;
+   document.getElementById('trackingStatus').textContent=shifts.length>=8?'Tracking image features. More textured, well-lit views usually work better.':'Low tracking confidence; point at a well-lit, detailed, stationary scene.';
+  }else{document.getElementById('tracks').textContent='0';document.getElementById('trackingStatus').textContent='No reliable patches. Try better lighting and a textured, stationary view.';}
+ }
+ previous=cur;raf=requestAnimationFrame(trackLoop);
+}
+async function enableSensors(){
+ try{
+  if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function'){
+   const result=await DeviceOrientationEvent.requestPermission();if(result!=='granted')throw new Error('Permission not granted');
+  }
+  window.addEventListener('deviceorientation',e=>{
+   lastSensor={yaw:e.alpha,pitch:e.beta,roll:e.gamma};
+   document.getElementById('yaw').textContent=e.alpha==null?'—':e.alpha.toFixed(1)+'°';
+   document.getElementById('pitch').textContent=e.beta==null?'—':e.beta.toFixed(1)+'°';
+   document.getElementById('roll').textContent=e.gamma==null?'—':e.gamma.toFixed(1)+'°';
+  });
+  sensorEnabled=true;document.getElementById('cameraStatus').textContent+=' Motion sensors enabled.';
+ }catch(e){document.getElementById('cameraStatus').textContent='Motion sensors unavailable: '+e.message;}
+}
+document.getElementById('sensor').onclick=enableSensors;
+renderShots();
+if(!navigator.mediaDevices?.getUserMedia)document.getElementById('cameraStatus').textContent='This browser does not support camera access. Try a current version of Chrome or Safari over HTTPS.';
+</script>
+</body>
+</html>
